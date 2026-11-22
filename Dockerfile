@@ -14,8 +14,10 @@ COPY src/ src/
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/build/target,sharing=locked \
     if [ "$BUILDARCH" = "$TARGETARCH" ]; then \
+      cargo clean -p codec-shopping-sessions --release && \
       cargo build --locked --release && cp target/release/codec-shopping-sessions /shopping-sessions; \
     else \
+      cargo clean -p codec-shopping-sessions --release --target x86_64-unknown-linux-gnu && \
       CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=x86_64-linux-gnu-gcc \
         cargo build --locked --release --target x86_64-unknown-linux-gnu && \
       cp target/x86_64-unknown-linux-gnu/release/codec-shopping-sessions /shopping-sessions; \
