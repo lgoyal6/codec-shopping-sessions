@@ -9,7 +9,7 @@ use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHasher};
 
 use crate::identity::{Campaigns, People, Products};
-use crate::input::{DAY, ParsedRow, WEEK, Window, csv_chunks, decimal, lines, timestamp};
+use crate::input::{DAY, WEEK, Window, csv_chunks, decimal, fields, lines, timestamp};
 
 pub const SHARDS: usize = 64;
 const EVENT_ID_SHARDS: usize = 256;
@@ -208,6 +208,15 @@ impl ChunkIndex {
 
 pub struct EventPartitions(Vec<ChunkIndex>);
 
+impl EventPartitions {
+    pub fn index_bytes(&self) -> usize {
+        self.0
+            .iter()
+            .map(|chunk| chunk.ids.capacity() + chunk.rows.capacity() * size_of::<IndexedLine>())
+            .sum()
+    }
+}
+
 pub fn partition_events(
     files: &[Mmap],
     products: &Products<'_>,
@@ -222,11 +231,7 @@ pub fn partition_events(
             let mut rows = Vec::with_capacity(chunk.len() / 76);
             let mut counts = [0; EVENT_ID_SHARDS];
             let mut ids = Vec::with_capacity(chunk.len() / 6);
-            for line in lines(chunk) {
-                let Some(row) = ParsedRow::<7>::parse(line) else {
-                    continue;
-                };
-                let values = row.values();
+            for values in lines(chunk).filter_map(fields::<7>) {
                 let id = values[0];
                 if id.is_empty() {
                     continue;
@@ -260,8 +265,33 @@ pub fn partition_events(
                 counts[record.shard()] += 1;
                 rows.push(record);
             }
-            let ends = group_by_index(&mut rows, &counts, IndexedLine::shard);
-            ChunkIndex { ids, rows, ends }
+            let mut offset = 0;
+            let mut next = [0; EVENT_ID_SHARDS];
+            let ends: Vec<_> = counts
+                .into_iter()
+                .zip(&mut next)
+                .map(|(count, start)| {
+                    *start = offset;
+                    offset += count;
+                    offset
+                })
+                .collect();
+            let mut grouped = Vec::with_capacity(rows.len());
+            let slots = grouped.spare_capacity_mut();
+            for row in rows {
+                let position = &mut next[row.shard()];
+                slots[*position].write(row);
+                *position += 1;
+            }
+            debug_assert_eq!(next.as_slice(), ends.as_slice());
+            // The counts and rows were updated together, so their shard ranges
+            // are disjoint and the loop initialized every position below offset.
+            unsafe { grouped.set_len(offset) };
+            ChunkIndex {
+                ids,
+                rows: grouped,
+                ends,
+            }
         })
         .collect();
     EventPartitions(index)
@@ -329,8 +359,7 @@ pub fn clicks<'a>(
         .map_init(FxHashMap::default, |local, chunk| {
             local.clear();
             let mut routed = buckets();
-            for row in lines(chunk).filter_map(ParsedRow::<4>::parse) {
-                let [id, person, campaign, raw_time] = row.values();
+            for [id, person, campaign, raw_time] in lines(chunk).filter_map(fields::<4>) {
                 if id.is_empty() || person.is_empty() {
                     continue;
                 }

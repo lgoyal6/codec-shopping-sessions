@@ -17,6 +17,8 @@ use crate::analytics::CampaignTotals;
 use crate::identity::{Campaigns, People, Products};
 use crate::input::{Window, csv_paths, map_csv};
 
+const HEAP_TRIM_INDEX_BYTES: usize = 2 * 1024 * 1024 * 1024;
+
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 fn directory(name: &str, default: &str) -> PathBuf {
@@ -31,6 +33,18 @@ fn load(dir: &Path) -> io::Result<Vec<Mmap>> {
         }
     }
     Ok(files)
+}
+
+fn release_unused_heap() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        unsafe extern "C" {
+            fn malloc_trim(pad: usize) -> std::ffi::c_int;
+        }
+        // Event deduplication just dropped the large input index. Return free
+        // allocator pages before click sorting starts faulting mapped data in.
+        unsafe { malloc_trim(0) };
+    }
 }
 
 struct Profile {
@@ -94,8 +108,16 @@ fn main() -> Result<()> {
         records::partition_events(&event_files, &products, &people, &names, window);
     drop(event_files);
     profile.mark("event_scan_validate_partition");
+    let index_bytes = event_partitions.index_bytes();
+    if profile.enabled {
+        eprintln!("event_index_bytes {index_bytes}");
+    }
     let events = records::deduplicate_events(event_partitions);
     profile.mark("event_dedup_route");
+    if index_bytes >= HEAP_TRIM_INDEX_BYTES {
+        release_unused_heap();
+        profile.mark("release_event_memory");
+    }
 
     let names = names.freeze();
     let click_files = load(&data.join("clicks"))?;

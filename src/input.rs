@@ -55,25 +55,31 @@ pub fn csv_chunks(files: &[Mmap]) -> Vec<&[u8]> {
 }
 
 pub fn lines(data: &[u8]) -> impl Iterator<Item = &[u8]> {
-    data.split_inclusive(|&byte| byte == b'\n')
-        .map(|line| line.strip_suffix(b"\n").unwrap_or(line))
+    let mut start = 0;
+    let final_end = (!data.is_empty() && !data.ends_with(b"\n")).then_some(data.len());
+    memchr::memchr_iter(b'\n', data)
+        .chain(final_end)
+        .map(move |end| {
+            let line = &data[start..end];
+            start = end + 1;
+            line
+        })
 }
 
 pub fn fields<const WIDTH: usize>(line: &[u8]) -> Option<[&[u8]; WIDTH]> {
     let mut values = [&[][..]; WIDTH];
+    let (last, prefix) = values.split_last_mut()?;
+    let mut commas = memchr::memchr_iter(b',', line);
     let mut start = 0;
-    let mut count = 0;
-    for (end, &byte) in line.iter().enumerate() {
-        if byte == b',' {
-            *values.get_mut(count)? = unquote(&line[start..end])?;
-            count += 1;
-            start = end + 1;
-        }
+    for value in prefix {
+        let end = commas.next()?;
+        *value = unquote(&line[start..end])?;
+        start = end + 1;
     }
-    if count + 1 != WIDTH {
+    if commas.next().is_some() {
         return None;
     }
-    values[count] = unquote(&line[start..])?;
+    *last = unquote(&line[start..])?;
     Some(values)
 }
 
@@ -182,76 +188,5 @@ impl Window {
             return Err(io::Error::new(ErrorKind::InvalidData, "invalid time window").into());
         }
         Ok(Self { start, end })
-    }
-}
-
-/// Retain field boundaries for the second pass over a validated CSV row.
-#[derive(Clone, Copy)]
-pub struct ParsedRow<'a, const WIDTH: usize> {
-    line: &'a [u8],
-    layout: u64,
-}
-
-impl<'a, const WIDTH: usize> ParsedRow<'a, WIDTH> {
-    pub fn parse(line: &'a [u8]) -> Option<Self> {
-        let mut commas = memchr::memchr_iter(b',', line);
-        let mut layout = 0;
-        let mut start = 0;
-        for column in 0..WIDTH {
-            let end = if column + 1 == WIDTH {
-                if commas.next().is_some() {
-                    return None;
-                }
-                line.len()
-            } else {
-                commas.next()?
-            };
-            let raw = &line[start..end];
-            let value = unquote(raw)?;
-            if value.len() != raw.len() {
-                layout |= 1 << (56 + column);
-            }
-            if column + 1 < WIDTH {
-                layout |= ((end & 0xff) as u64) << (8 * column);
-            }
-            start = end + 1;
-        }
-        if line.len() > usize::from(u8::MAX) {
-            layout = u64::MAX;
-        }
-        Some(Self { line, layout })
-    }
-
-    #[inline]
-    pub fn value(self, column: usize) -> &'a [u8] {
-        if self.layout == u64::MAX {
-            return fields::<WIDTH>(self.line).unwrap()[column];
-        }
-        let start = if column == 0 {
-            0
-        } else {
-            self.comma(column - 1) + 1
-        };
-        let end = if column + 1 == WIDTH {
-            self.line.len()
-        } else {
-            self.comma(column)
-        };
-        let quote = ((self.layout >> (56 + column)) & 1) as usize;
-        &self.line[start + quote..end - quote]
-    }
-
-    #[inline]
-    fn comma(self, column: usize) -> usize {
-        ((self.layout >> (8 * column)) & 0xff) as usize
-    }
-
-    #[inline]
-    pub fn values(self) -> [&'a [u8]; WIDTH] {
-        if self.layout == u64::MAX {
-            fields(self.line).unwrap()
-        } else {
-            std::array::from_fn(|column| self.value(column))
-        }
     }
 }
