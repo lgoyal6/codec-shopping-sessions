@@ -104,16 +104,28 @@ fn main() -> Result<()> {
     profile.mark("dimensions_links");
 
     let event_files = load(&data.join("events"))?;
-    let event_partitions =
-        records::partition_events(&event_files, &products, &people, &names, window);
-    drop(event_files);
-    profile.mark("event_scan_validate_partition");
-    let index_bytes = event_partitions.index_bytes();
+    let (events, index_bytes) =
+        match records::route_events_once(&event_files, &products, &people, &names, window) {
+            Some(routed) => {
+                drop(event_files);
+                profile.mark("event_stream_exact_dedup_route");
+                (routed.people, routed.temporary_bytes)
+            }
+            None => {
+                profile.mark("event_stream_fallback");
+                let partitions =
+                    records::partition_events(&event_files, &products, &people, &names, window);
+                drop(event_files);
+                profile.mark("event_scan_validate_partition");
+                let bytes = partitions.index_bytes();
+                let events = records::deduplicate_events(partitions);
+                profile.mark("event_dedup_route");
+                (events, bytes)
+            }
+        };
     if profile.enabled {
         eprintln!("event_index_bytes {index_bytes}");
     }
-    let events = records::deduplicate_events(event_partitions);
-    profile.mark("event_dedup_route");
     if index_bytes >= HEAP_TRIM_INDEX_BYTES {
         release_unused_heap();
         profile.mark("release_event_memory");

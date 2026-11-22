@@ -84,7 +84,7 @@ pub fn fields<const WIDTH: usize>(line: &[u8]) -> Option<[&[u8]; WIDTH]> {
 }
 
 #[inline]
-fn unquote(mut value: &[u8]) -> Option<&[u8]> {
+pub fn unquote(mut value: &[u8]) -> Option<&[u8]> {
     if value.len() >= 2 && value[0] == b'"' && value[value.len() - 1] == b'"' {
         value = &value[1..value.len() - 1];
     }

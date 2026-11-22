@@ -1,4 +1,5 @@
 use std::hash::{Hash, Hasher};
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
 
 use hashbrown::HashTable;
@@ -9,7 +10,7 @@ use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHasher};
 
 use crate::identity::{Campaigns, People, Products};
-use crate::input::{DAY, WEEK, Window, csv_chunks, decimal, fields, lines, timestamp};
+use crate::input::{DAY, WEEK, Window, csv_chunks, decimal, fields, lines, timestamp, unquote};
 
 pub const SHARDS: usize = 64;
 const EVENT_ID_SHARDS: usize = 256;
@@ -399,4 +400,303 @@ fn transpose<T>(data: Vec<Buckets<T>>) -> Vec<Vec<Vec<T>>> {
         }
     }
     output
+}
+
+struct EventClaims<'a> {
+    chunks: Vec<&'a [u8]>,
+    slots: Vec<AtomicU64>,
+    offset_bits: u32,
+    reference_mask: u64,
+}
+
+impl<'a> EventClaims<'a> {
+    fn new(chunks: Vec<&'a [u8]>) -> Option<Self> {
+        let bytes = chunks.iter().map(|chunk| chunk.len()).sum::<usize>();
+        let widest = chunks.iter().map(|chunk| chunk.len()).max().unwrap_or(0);
+        let offset_bits = usize::BITS - widest.leading_zeros();
+        let chunk_bits = usize::BITS - chunks.len().leading_zeros();
+        // The reference points into an immutable CSV chunk. The remaining
+        // bits hold a tag used only to rule out unequal keys quickly.
+        if offset_bits > u32::BITS || offset_bits + chunk_bits > 48 {
+            return None;
+        }
+        let reference_mask = (1_u64 << (offset_bits + chunk_bits)) - 1;
+        const MAX_TABLE_BYTES: usize = 512 * 1024 * 1024;
+        let slots = (bytes / 44).max(1024).next_power_of_two();
+        // Larger tables reduce locality and were slower at final scale.
+        // Leave that workload to the partitioned implementation.
+        if slots > MAX_TABLE_BYTES / size_of::<AtomicU64>() {
+            return None;
+        }
+        let mut table = Vec::with_capacity(slots);
+        table.resize_with(slots, || AtomicU64::new(0));
+        Some(Self {
+            chunks,
+            slots: table,
+            offset_bits,
+            reference_mask,
+        })
+    }
+
+    fn reference(&self, chunk: usize, offset: u32) -> u64 {
+        ((chunk as u64) << self.offset_bits | u64::from(offset)) + 1
+    }
+
+    fn linked_fields(&self, reference: u64) -> (&'a [u8], &'a [u8]) {
+        let encoded = reference - 1;
+        let chunk = &self.chunks[(encoded >> self.offset_bits) as usize];
+        let offset_mask = (1_u64 << self.offset_bits) - 1;
+        let row = &chunk[(encoded & offset_mask) as usize..];
+        // Every published reference comes from fields::<7>, so these
+        // delimiter positions and the complete fields are already valid.
+        let mut commas = memchr::memchr_iter(b',', row);
+        let first = commas.next().unwrap();
+        let start = commas.nth(1).unwrap() + 1;
+        let stop = commas.next().unwrap();
+        (
+            unquote(&row[..first]).unwrap(),
+            unquote(&row[start..stop]).unwrap(),
+        )
+    }
+
+    fn claim(
+        &self,
+        id: &[u8],
+        ingest: &[u8],
+        reference: u64,
+        displaced: &mut Vec<u64>,
+    ) -> Option<bool> {
+        let hash = key_hash(id);
+        let tag = hash & !self.reference_mask;
+        let incoming = tag | reference;
+        let mask = self.slots.len() - 1;
+        let start = hash as usize & mask;
+        for probe in 0..512 {
+            let slot = &self.slots[(start + probe) & mask];
+            let mut prior = slot.load(Relaxed);
+            loop {
+                if prior != 0 {
+                    if prior & !self.reference_mask != tag {
+                        break;
+                    }
+                    let (old_id, old_ingest) = self.linked_fields(prior & self.reference_mask);
+                    if old_id != id {
+                        break;
+                    }
+                    // All ingest values use the same canonical UTC format.
+                    // Comparing their bytes is equivalent to comparing time.
+                    if old_ingest <= ingest {
+                        return Some(false);
+                    }
+                }
+                // Slots never change keys and only move to an earlier
+                // copy of that key. All referenced CSV bytes are immutable.
+                match slot.compare_exchange_weak(prior, incoming, Relaxed, Relaxed) {
+                    Ok(old) => {
+                        if old != 0 {
+                            displaced.push(old & self.reference_mask);
+                        }
+                        return Some(true);
+                    }
+                    Err(observed) => prior = observed,
+                }
+            }
+        }
+        None
+    }
+}
+
+struct ClaimedEvent {
+    time: i64,
+    offset: u32,
+    person: u32,
+    amount: u32,
+    category: u32,
+}
+
+const _: () = assert!(size_of::<ClaimedEvent>() == 24);
+
+impl ClaimedEvent {
+    fn event(self) -> Event {
+        Event {
+            person: self.person,
+            time: self.time,
+            amount: self.amount,
+            category: self.category,
+        }
+    }
+}
+
+struct ClaimedChunk {
+    rows: Buckets<ClaimedEvent>,
+    displaced: Vec<u64>,
+}
+
+pub struct RoutedEvents {
+    pub people: Vec<Vec<Vec<Event>>>,
+    pub temporary_bytes: usize,
+}
+
+pub fn route_events_once(
+    files: &[Mmap],
+    products: &Products<'_>,
+    people: &People<'_>,
+    names: &PersonNames,
+    window: Window,
+) -> Option<RoutedEvents> {
+    let mut claims = EventClaims::new(csv_chunks(files))?;
+    let parts: Option<Vec<_>> = claims
+        .chunks
+        .par_iter()
+        .enumerate()
+        .map_init(FxHashMap::default, |local_names, (index, chunk)| {
+            local_names.clear();
+            let mut rows = buckets();
+            let mut displaced = Vec::new();
+            let start = chunk.as_ptr() as usize;
+            for line in lines(chunk) {
+                let Some(values) = fields::<7>(line) else {
+                    continue;
+                };
+                let id = values[0];
+                if id.is_empty() {
+                    continue;
+                }
+                let offset = (line.as_ptr() as usize - start) as u32;
+                let raw_ingest = values[3];
+                if !claims.claim(
+                    id,
+                    raw_ingest,
+                    claims.reference(index, offset),
+                    &mut displaced,
+                )? {
+                    continue;
+                }
+                let ingest = timestamp(raw_ingest).expect("ingest_ts is a valid UTC timestamp");
+                if let Some(valid) = event(values, products, window, ingest) {
+                    let (bucket, person) = *local_names.entry(valid.person).or_insert_with(|| {
+                        people
+                            .linked_route(valid.person)
+                            .unwrap_or_else(|| names.intern(valid.person))
+                    });
+                    rows[bucket].push(ClaimedEvent {
+                        offset,
+                        person,
+                        time: valid.time,
+                        amount: valid.amount,
+                        category: valid.category,
+                    });
+                }
+            }
+            Some(ClaimedChunk { rows, displaced })
+        })
+        .collect();
+    let mut parts = parts?;
+    let mut temporary_bytes = claims.slots.capacity() * size_of::<AtomicU64>();
+    temporary_bytes += parts
+        .iter()
+        .flat_map(|part| part.rows.iter())
+        .map(|bucket| bucket.capacity() * size_of::<ClaimedEvent>())
+        .sum::<usize>();
+    drop(std::mem::take(&mut claims.slots));
+
+    let mut displaced: Vec<_> = parts
+        .iter_mut()
+        .flat_map(|part| std::mem::take(&mut part.displaced))
+        .collect();
+    displaced.par_sort_unstable();
+    let routed = parts
+        .into_par_iter()
+        .enumerate()
+        .map(|(index, part)| {
+            let first = claims.reference(index, 0);
+            let last = first + claims.chunks[index].len() as u64;
+            let start = displaced.partition_point(|&reference| reference < first);
+            let stop = start + displaced[start..].partition_point(|&reference| reference < last);
+            if start == stop {
+                return part
+                    .rows
+                    .map(|rows| rows.into_iter().map(ClaimedEvent::event).collect());
+            }
+
+            let mut mask = vec![0_u64; claims.chunks[index].len().div_ceil(64)];
+            for reference in &displaced[start..stop] {
+                let offset = (reference - first) as usize;
+                mask[offset / 64] |= 1_u64 << (offset % 64);
+            }
+            part.rows.map(|rows| {
+                rows.into_iter()
+                    .filter_map(|event| {
+                        let offset = event.offset as usize;
+                        (mask[offset / 64] & (1_u64 << (offset % 64)) == 0).then(|| event.event())
+                    })
+                    .collect()
+            })
+        })
+        .collect();
+    Some(RoutedEvents {
+        people: transpose(routed),
+        temporary_bytes,
+    })
+}
+
+#[cfg(test)]
+mod claim_tests {
+    use super::*;
+
+    #[test]
+    fn concurrent_claims_keep_full_keys_and_the_earliest_copy() {
+        const REFERENCE_MASK: u64 = (1 << 60) - 1;
+        const INDEX_MASK: u64 = 1023;
+        let first = "evt-unique";
+        let wanted = key_hash(first.as_bytes()) & (!REFERENCE_MASK | INDEX_MASK);
+        let collision = (0..1_000_000)
+            .map(|number| format!("evt-{number}"))
+            .find(|id| key_hash(id.as_bytes()) & (!REFERENCE_MASK | INDEX_MASK) == wanted)
+            .expect("find a distinct full key with the same initial slot and tag");
+        let records: Vec<_> = (0..60)
+            .rev()
+            .map(|second| {
+                let id = if second % 2 == 0 { first } else { &collision };
+                format!("\"{id}\",user,0,2025-01-01T00:00:{second:02}Z,view,product,0\n")
+            })
+            .collect();
+        let mut claims = EventClaims::new(records.iter().map(|row| row.as_bytes()).collect())
+            .expect("encode the synthetic test chunks");
+        claims.reference_mask = REFERENCE_MASK;
+        assert_eq!(claims.slots.len(), 1024);
+
+        let displaced: Vec<_> = claims
+            .chunks
+            .par_iter()
+            .enumerate()
+            .map(|(index, row)| {
+                let values = fields::<7>(row.strip_suffix(b"\n").unwrap()).unwrap();
+                let mut displaced = Vec::new();
+                let reference = claims.reference(index, 0);
+                if !claims
+                    .claim(values[0], values[3], reference, &mut displaced)
+                    .unwrap()
+                {
+                    displaced.push(reference);
+                }
+                displaced
+            })
+            .collect();
+
+        let mut losers: Vec<_> = displaced.into_iter().flatten().collect();
+        losers.sort_unstable();
+        let expected: Vec<_> = (0..58).map(|index| claims.reference(index, 0)).collect();
+        assert_eq!(losers, expected);
+        let winners: Vec<_> = claims
+            .slots
+            .iter()
+            .map(|slot| slot.load(Relaxed) & REFERENCE_MASK)
+            .filter(|&reference| reference != 0)
+            .map(|reference| claims.linked_fields(reference))
+            .collect();
+        assert_eq!(winners.len(), 2);
+        assert!(winners.contains(&(first.as_bytes(), b"2025-01-01T00:00:00Z")));
+        assert!(winners.contains(&(collision.as_bytes(), b"2025-01-01T00:00:01Z")));
+    }
 }
