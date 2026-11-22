@@ -1,0 +1,22 @@
+[package]
+name = "codec-shopping-sessions"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+publish = false
+
+[dependencies]
+arrow-array = "60.0.0"
+arrow-schema = "60.0.0"
+hashbrown = { version = "0.17", default-features = false }
+memchr = "2.8"
+memmap2 = "0.9"
+parquet = { version = "60.0.0", default-features = false, features = ["arrow", "snap"] }
+rayon = "1.12"
+rustc-hash = "2.1"
+serde_json = "1"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
