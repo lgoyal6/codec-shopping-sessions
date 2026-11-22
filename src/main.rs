@@ -95,10 +95,10 @@ fn main() -> Result<()> {
     let events = records::deduplicate_events(event_partitions);
     profile.mark("event_dedup_route");
 
+    let names = names.freeze();
     let click_files = load(&data.join("clicks"))?;
-    let click_partitions = records::partition::<4>(&click_files);
-    let clicks = records::clicks(click_partitions, &campaigns, &people, &names, window);
-    profile.mark("click_scan_dedup");
+    let clicks = records::clicks(&click_files, &campaigns, &people, &names, window);
+    profile.mark("click_scan_route");
 
     let names = names.finish();
     let shards = events

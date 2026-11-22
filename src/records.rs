@@ -85,14 +85,21 @@ impl PersonNames {
         (bucket, id)
     }
 
+    pub fn freeze(self) -> FrozenNames {
+        FrozenNames(self.0.map(|names| names.into_inner().unwrap()))
+    }
+}
+
+pub struct FrozenNames([Names; SHARDS]);
+
+impl FrozenNames {
     fn lookup(&self, person: &[u8]) -> Option<(usize, u32)> {
         let bucket = shard(person);
-        let names = self.0[bucket].lock().unwrap();
-        names.ids.get(person).map(|&id| (bucket, id))
+        self.0[bucket].ids.get(person).map(|&id| (bucket, id))
     }
 
     pub fn finish(self) -> [Vec<Arc<[u8]>>; SHARDS] {
-        self.0.map(|names| names.into_inner().unwrap().values)
+        self.0.map(|names| names.values)
     }
 }
 
@@ -117,25 +124,6 @@ pub struct Click<'a> {
     pub id: &'a [u8],
     pub time: i64,
     pub campaign: u32,
-}
-
-type Partitions<'a, const WIDTH: usize> = Vec<Vec<Vec<ParsedRow<'a, WIDTH>>>>;
-
-pub fn partition<const WIDTH: usize>(files: &[Mmap]) -> Partitions<'_, WIDTH> {
-    let local = csv_chunks(files)
-        .into_par_iter()
-        .map(|chunk| {
-            let mut rows = buckets();
-            for row in lines(chunk).filter_map(ParsedRow::<WIDTH>::parse) {
-                let id = row.value(0);
-                if !id.is_empty() {
-                    rows[shard(id)].push(row);
-                }
-            }
-            rows
-        })
-        .collect();
-    transpose(local)
 }
 
 #[inline]
@@ -318,51 +306,49 @@ pub fn deduplicate_events(partitions: EventPartitions) -> Vec<Vec<Vec<Event>>> {
 }
 
 pub fn clicks<'a>(
-    partitions: Partitions<'a, 4>,
+    files: &'a [Mmap],
     campaigns: &Campaigns<'_>,
     people: &'a People<'_>,
-    names: &PersonNames,
+    names: &FrozenNames,
     window: Window,
 ) -> Vec<Vec<Vec<Click<'a>>>> {
-    let by_person = partitions
+    // Copies of a click have identical data. Credit takes the first of
+    // equivalent ties, and assists union their intervals, so both are
+    // idempotent. Streaming identical clicks avoids a separate ID partition.
+    let by_person = csv_chunks(files)
         .into_par_iter()
-        .map(|pieces| {
-            let capacity: usize = pieces.iter().map(Vec::len).sum();
-            let mut seen =
-                rustc_hash::FxHashSet::with_capacity_and_hasher(capacity, Default::default());
+        .map(|chunk| {
             let mut routed = buckets();
             let mut local = FxHashMap::default();
-            for piece in pieces {
-                for line in piece {
-                    let [id, person, campaign, raw_time] = line.values();
-                    if !seen.insert(id) || person.is_empty() {
-                        continue;
-                    }
-                    let (Some(&campaign), Some(time)) =
-                        (campaigns.ids.get(campaign), timestamp(raw_time))
-                    else {
-                        continue;
-                    };
-                    if time < window.start - WEEK || time >= window.end {
-                        continue;
-                    }
-                    let name = people.resolve(person);
-                    let Some((bucket, person)) =
-                        *local.entry(name).or_insert_with(|| names.lookup(name))
-                    else {
-                        continue;
-                    };
-                    routed[bucket].push(Click {
-                        person,
-                        id,
-                        time,
-                        campaign,
-                    });
+            for row in lines(chunk).filter_map(ParsedRow::<4>::parse) {
+                let [id, person, campaign, raw_time] = row.values();
+                if id.is_empty() || person.is_empty() {
+                    continue;
                 }
+                let (Some(&campaign), Some(time)) =
+                    (campaigns.ids.get(campaign), timestamp(raw_time))
+                else {
+                    continue;
+                };
+                if time < window.start - WEEK || time >= window.end {
+                    continue;
+                }
+                let name = people.resolve(person);
+                let Some((bucket, person)) =
+                    *local.entry(name).or_insert_with(|| names.lookup(name))
+                else {
+                    continue;
+                };
+                routed[bucket].push(Click {
+                    person,
+                    id,
+                    time,
+                    campaign,
+                });
             }
             routed
         })
-        .collect::<Vec<_>>();
+        .collect();
     transpose(by_person)
 }
 
