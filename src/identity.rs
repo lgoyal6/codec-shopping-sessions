@@ -4,7 +4,7 @@ use crate::input::{data_lines, fields, lines};
 
 pub struct People<'a> {
     ids: FxHashMap<&'a [u8], usize>,
-    canonical: Vec<&'a [u8]>,
+    routes: Vec<(usize, u32)>,
 }
 
 struct Component<'a> {
@@ -23,7 +23,10 @@ fn root(nodes: &mut [Component<'_>], mut node: usize) -> usize {
 }
 
 impl<'a> People<'a> {
-    pub fn from_links(files: impl Iterator<Item = &'a [u8]>) -> Self {
+    pub fn from_links(
+        files: impl Iterator<Item = &'a [u8]>,
+        mut intern_root: impl FnMut(&[u8]) -> (usize, u32),
+    ) -> Self {
         let mut ids = FxHashMap::default();
         let mut nodes = Vec::<Component<'a>>::new();
         for [a, b] in files
@@ -56,20 +59,20 @@ impl<'a> People<'a> {
             nodes[left].size += nodes[right].size;
             nodes[left].name = nodes[left].name.min(nodes[right].name);
         }
-        let canonical = (0..nodes.len())
+        let mut roots = vec![None; nodes.len()];
+        let routes = (0..nodes.len())
             .map(|index| {
                 let representative = root(&mut nodes, index);
-                nodes[representative].name
+                *roots[representative]
+                    .get_or_insert_with(|| intern_root(nodes[representative].name))
             })
             .collect();
-        Self { ids, canonical }
+        Self { ids, routes }
     }
 
     #[inline]
-    pub fn resolve<'b>(&'b self, name: &'b [u8]) -> &'b [u8] {
-        self.ids
-            .get(name)
-            .map_or(name, |&index| self.canonical[index])
+    pub fn linked_route(&self, name: &[u8]) -> Option<(usize, u32)> {
+        self.ids.get(name).map(|&index| self.routes[index])
     }
 }
 

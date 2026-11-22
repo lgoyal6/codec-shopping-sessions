@@ -71,6 +71,14 @@ impl PersonNames {
         Self(std::array::from_fn(|_| Mutex::default()))
     }
 
+    pub fn add_linked(&self, person: &[u8]) -> (usize, u32) {
+        let bucket = shard(person);
+        let mut names = self.0[bucket].lock().unwrap();
+        let id = u32::try_from(names.values.len()).expect("too many person IDs");
+        names.values.push(Arc::from(person));
+        (bucket, id)
+    }
+
     fn intern(&self, person: &[u8]) -> (usize, u32) {
         let bucket = shard(person);
         let mut names = self.0[bucket].lock().unwrap();
@@ -130,7 +138,6 @@ pub struct Click<'a> {
 fn event<'a>(
     row: [&'a [u8]; 7],
     products: &Products<'_>,
-    people: &'a People<'_>,
     window: Window,
     ingest: i64,
 ) -> Option<ValidatedEvent<'a>> {
@@ -154,7 +161,7 @@ fn event<'a>(
         return None;
     }
     Some(ValidatedEvent {
-        person: people.resolve(person),
+        person,
         time,
         amount,
         category,
@@ -236,10 +243,12 @@ pub fn partition_events(
                     bucket: INVALID_EVENT_BUCKET,
                 };
                 // Keep an invalid winner as a tombstone until all IDs are deduplicated.
-                if let Some(valid) = event(values, products, people, window, ingest) {
-                    let (bucket, person) = *local_names
-                        .entry(valid.person)
-                        .or_insert_with(|| names.intern(valid.person));
+                if let Some(valid) = event(values, products, window, ingest) {
+                    let (bucket, person) = *local_names.entry(valid.person).or_insert_with(|| {
+                        people
+                            .linked_route(valid.person)
+                            .unwrap_or_else(|| names.intern(valid.person))
+                    });
                     record.bucket = bucket as u8;
                     record.person = person;
                     record.time = valid.time;
@@ -333,10 +342,9 @@ pub fn clicks<'a>(
                 if time < window.start - WEEK || time >= window.end {
                     continue;
                 }
-                let name = people.resolve(person);
-                let Some((bucket, person)) =
-                    *local.entry(name).or_insert_with(|| names.lookup(name))
-                else {
+                let Some((bucket, person)) = *local.entry(person).or_insert_with(|| {
+                    people.linked_route(person).or_else(|| names.lookup(person))
+                }) else {
                     continue;
                 };
                 routed[bucket].push(Click {

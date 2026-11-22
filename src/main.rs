@@ -83,11 +83,13 @@ fn main() -> Result<()> {
     let campaign_file = fs::read(data.join("campaigns.csv"))?;
     let products = Products::load(&product_file);
     let campaigns = Campaigns::load(&campaign_file);
-    let people = People::from_links(link_files.iter().map(|file| file.as_ref()));
+    let names = records::PersonNames::new();
+    let people = People::from_links(link_files.iter().map(|file| file.as_ref()), |canonical| {
+        names.add_linked(canonical)
+    });
     profile.mark("dimensions_links");
 
     let event_files = load(&data.join("events"))?;
-    let names = records::PersonNames::new();
     let event_partitions =
         records::partition_events(&event_files, &products, &people, &names, window);
     drop(event_files);
