@@ -144,8 +144,9 @@ fn event<'a>(
     products: &Products<'_>,
     people: &'a People<'_>,
     window: Window,
+    ingest: i64,
 ) -> Option<ValidatedEvent<'a>> {
-    let [_, person, raw_time, raw_ingest, kind, product, raw_price] = row;
+    let [_, person, raw_time, _, kind, product, raw_price] = row;
     if person.is_empty() || product.is_empty() {
         return None;
     }
@@ -161,7 +162,7 @@ fn event<'a>(
         _ => return None,
     };
     let time = timestamp(raw_time)?;
-    if time < window.start || time >= window.end || timestamp(raw_ingest)? - time > DAY {
+    if time < window.start || time >= window.end || ingest - time > DAY {
         return None;
     }
     Some(ValidatedEvent {
@@ -172,25 +173,18 @@ fn event<'a>(
     })
 }
 
-fn offset_in(chunk: &[u8], line: &[u8]) -> usize {
-    line.as_ptr() as usize - chunk.as_ptr() as usize
-}
-
-fn ingest_order(timestamp: &[u8]) -> u64 {
-    // Ingest timestamps are valid fixed-width UTC strings with second precision.
-    let mut order = 0;
-    for position in [0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, 17, 18] {
-        order = order * 10 + u64::from(timestamp[position] - b'0');
-    }
-    order
-}
+const INVALID_EVENT_BUCKET: u8 = u8::MAX;
 
 #[derive(Clone, Copy)]
 struct IndexedLine {
     hash: u64,
-    offset: usize,
     id_offset: usize,
-    ingest_order: u64,
+    ingest: i64,
+    time: i64,
+    person: u32,
+    amount: u32,
+    category: u32,
+    bucket: u8,
 }
 
 impl IndexedLine {
@@ -217,137 +211,107 @@ impl ChunkIndex {
     }
 }
 
-pub struct EventPartitions<'a> {
-    chunks: Vec<&'a [u8]>,
-    index: Vec<ChunkIndex>,
-}
+pub struct EventPartitions(Vec<ChunkIndex>);
 
-pub fn partition_events(files: &[Mmap]) -> EventPartitions<'_> {
-    let chunks = csv_chunks(files);
-    let index = chunks
-        .par_iter()
-        .map(|&chunk| {
+pub fn partition_events(
+    files: &[Mmap],
+    products: &Products<'_>,
+    people: &People<'_>,
+    names: &PersonNames,
+    window: Window,
+) -> EventPartitions {
+    let index = csv_chunks(files)
+        .into_par_iter()
+        .map(|chunk| {
             let mut rows = Vec::with_capacity(chunk.len() / 88);
             let mut counts = [0; EVENT_ID_SHARDS];
             let mut ids = Vec::with_capacity(chunk.len() / 6);
+            let mut local_names = FxHashMap::default();
             for line in lines(chunk) {
                 let Some(row) = ParsedRow::<7>::parse(line) else {
                     continue;
                 };
-                let id = row.value(0);
-                if !id.is_empty() {
-                    let row = IndexedLine {
-                        hash: key_hash(id),
-                        offset: offset_in(chunk, line),
-                        id_offset: ids.len(),
-                        ingest_order: ingest_order(row.value(3)),
-                    };
-                    ids.extend_from_slice(id);
-                    ids.push(b',');
-                    counts[row.shard()] += 1;
-                    rows.push(row);
+                let values = row.values();
+                let id = values[0];
+                if id.is_empty() {
+                    continue;
                 }
+                let ingest = timestamp(values[3]).expect("ingest_ts is a valid UTC timestamp");
+                let mut record = IndexedLine {
+                    hash: key_hash(id),
+                    id_offset: ids.len(),
+                    ingest,
+                    time: 0,
+                    person: 0,
+                    amount: 0,
+                    category: 0,
+                    bucket: INVALID_EVENT_BUCKET,
+                };
+                // Keep an invalid winner as a tombstone until all IDs are deduplicated.
+                if let Some(valid) = event(values, products, people, window, ingest) {
+                    let (bucket, person) = *local_names
+                        .entry(valid.person)
+                        .or_insert_with(|| names.intern(valid.person));
+                    record.bucket = bucket as u8;
+                    record.person = person;
+                    record.time = valid.time;
+                    record.amount = valid.amount;
+                    record.category = valid.category;
+                }
+                ids.extend_from_slice(id);
+                ids.push(b',');
+                counts[record.shard()] += 1;
+                rows.push(record);
             }
             let ends = group_by_index(&mut rows, &counts, IndexedLine::shard);
             ChunkIndex { ids, rows, ends }
         })
         .collect();
-    EventPartitions { chunks, index }
+    EventPartitions(index)
 }
 
-pub struct EventWinners<'a> {
-    chunks: Vec<&'a [u8]>,
-    losers: Vec<Vec<usize>>,
-}
-
-pub fn deduplicate_events(partitions: EventPartitions<'_>) -> EventWinners<'_> {
-    let EventPartitions { chunks, index } = partitions;
-    let losers = (0..EVENT_ID_SHARDS)
+pub fn deduplicate_events(partitions: EventPartitions) -> Vec<Vec<Vec<Event>>> {
+    let index = partitions.0;
+    let routed = (0..EVENT_ID_SHARDS)
         .into_par_iter()
         .map(|shard| {
-            let mut discarded = Vec::new();
             let capacity = index.iter().map(|chunk| chunk.shard(shard).len()).sum();
-            let mut winners: HashTable<(usize, &IndexedLine)> = HashTable::with_capacity(capacity);
-            let keys = index
-                .iter()
-                .enumerate()
-                .flat_map(|(chunk, entry)| entry.shard(shard).iter().map(move |row| (chunk, row)));
-            for (chunk, row) in keys {
-                match winners.entry(
-                    row.hash,
-                    |(prior_chunk, prior)| {
-                        prior.hash == row.hash
-                            && index[*prior_chunk].id(prior) == index[chunk].id(row)
-                    },
-                    |(_, row)| row.hash,
-                ) {
-                    Entry::Occupied(mut entry) => {
-                        let winner = entry.get_mut();
-                        let (discarded_chunk, discarded_row) =
-                            if row.ingest_order < winner.1.ingest_order {
-                                std::mem::replace(winner, (chunk, row))
-                            } else {
-                                (chunk, row)
-                            };
-                        discarded.push((discarded_chunk, discarded_row.offset));
-                    }
-                    Entry::Vacant(entry) => {
-                        entry.insert((chunk, row));
-                    }
-                }
-            }
-            discarded
-        })
-        .collect::<Vec<_>>();
-    let mut by_chunk = vec![Vec::new(); chunks.len()];
-    for (chunk, offset) in losers.into_iter().flatten() {
-        by_chunk[chunk].push(offset);
-    }
-    EventWinners {
-        chunks,
-        losers: by_chunk,
-    }
-}
-
-pub fn events<'a>(
-    winners: EventWinners<'a>,
-    products: &Products<'_>,
-    people: &'a People<'_>,
-    names: &PersonNames,
-    window: Window,
-) -> Vec<Vec<Vec<Event>>> {
-    // Deduplication only uses the compact index. Validation then streams the original files.
-    let routed = winners
-        .chunks
-        .into_par_iter()
-        .zip(winners.losers)
-        .map(|(chunk, mut losers)| {
-            losers.sort_unstable();
-            let mut losers = losers.into_iter().peekable();
-            let mut routed = buckets();
-            let mut local = FxHashMap::default();
-            for line in lines(chunk) {
-                if losers.peek() == Some(&offset_in(chunk, line)) {
-                    losers.next();
-                    continue;
-                }
-                if let Some(row) = ParsedRow::<7>::parse(line) {
-                    if !row.value(0).is_empty() {
-                        if let Some(event) = event(row.values(), products, people, window) {
-                            let (bucket, person) = *local
-                                .entry(event.person)
-                                .or_insert_with(|| names.intern(event.person));
-                            routed[bucket].push(Event {
-                                person,
-                                time: event.time,
-                                amount: event.amount,
-                                category: event.category,
-                            });
+            let mut winners: HashTable<(&ChunkIndex, &IndexedLine)> =
+                HashTable::with_capacity(capacity);
+            for chunk in &index {
+                for row in chunk.shard(shard) {
+                    match winners.entry(
+                        row.hash,
+                        |(prior_chunk, prior)| {
+                            prior.hash == row.hash && prior_chunk.id(prior) == chunk.id(row)
+                        },
+                        |(_, row)| row.hash,
+                    ) {
+                        Entry::Occupied(mut entry) => {
+                            let winner = entry.get_mut();
+                            if row.ingest < winner.1.ingest {
+                                *winner = (chunk, row);
+                            }
+                        }
+                        Entry::Vacant(entry) => {
+                            entry.insert((chunk, row));
                         }
                     }
                 }
             }
-            routed
+
+            let mut output = buckets();
+            for (_, row) in winners {
+                if row.bucket != INVALID_EVENT_BUCKET {
+                    output[row.bucket as usize].push(Event {
+                        person: row.person,
+                        time: row.time,
+                        amount: row.amount,
+                        category: row.category,
+                    });
+                }
+            }
+            output
         })
         .collect();
     transpose(routed)

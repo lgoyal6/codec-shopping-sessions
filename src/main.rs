@@ -87,14 +87,13 @@ fn main() -> Result<()> {
     profile.mark("dimensions_links");
 
     let event_files = load(&data.join("events"))?;
-    let event_partitions = records::partition_events(&event_files);
-    profile.mark("event_scan_partition");
-    let winners = records::deduplicate_events(event_partitions);
-    profile.mark("event_dedup");
     let names = records::PersonNames::new();
-    let events = records::events(winners, &products, &people, &names, window);
+    let event_partitions =
+        records::partition_events(&event_files, &products, &people, &names, window);
     drop(event_files);
-    profile.mark("event_validate_route");
+    profile.mark("event_scan_validate_partition");
+    let events = records::deduplicate_events(event_partitions);
+    profile.mark("event_dedup_route");
 
     let click_files = load(&data.join("clicks"))?;
     let click_partitions = records::partition::<4>(&click_files);

@@ -274,14 +274,16 @@ pub fn summarize<'a>(
         let person_clicks = &mut clicks[click_start..click_end];
         person_events.sort_unstable_by_key(|event| event.time);
         person_clicks.sort_unstable_by(|a, b| a.time.cmp(&b.time).then_with(|| a.id.cmp(b.id)));
-        sessionize(
-            name,
-            person_events,
-            &mut sessions,
-            &mut days,
-            &mut categories,
-        );
-        attribution.credit(&sessions, person_clicks, &mut campaign_totals);
+        if !person_events.is_empty() {
+            sessionize(
+                name,
+                person_events,
+                &mut sessions,
+                &mut days,
+                &mut categories,
+            );
+            attribution.credit(&sessions, person_clicks, &mut campaign_totals);
+        }
         event_start = event_end;
         click_start = click_end;
     }
