@@ -3,10 +3,11 @@
 Team codec's Rust entry for the Builders Buildathon Databricks Shopping Sessions track.
 
 The pipeline memory-maps read-only CSV files, resolves linked identities with union-find,
-and selects event winners in exact-ID partitions. A second sequential pass validates
-the winners and routes events and clicks by canonical person. Each partition groups
-records by compact person ID, sorts by time, computes sessions, and aggregates
-last-click credit and seven-day assists.
+and assigns each linked identity a compact person ID. It scans the event files once,
+retains invalid copies for the earliest-ingest comparison, and routes only the
+surviving winners. It streams valid clicks into person partitions. Each partition
+sorts by time, computes sessions, and aggregates last-click credit and seven-day
+assists.
 The final stage writes the two required Parquet tables with logical DATE columns.
 
 ## Build and run

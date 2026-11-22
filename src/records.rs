@@ -217,11 +217,11 @@ pub fn partition_events(
 ) -> EventPartitions {
     let index = csv_chunks(files)
         .into_par_iter()
-        .map(|chunk| {
-            let mut rows = Vec::with_capacity(chunk.len() / 88);
+        .map_init(FxHashMap::default, |local_names, chunk| {
+            local_names.clear();
+            let mut rows = Vec::with_capacity(chunk.len() / 76);
             let mut counts = [0; EVENT_ID_SHARDS];
             let mut ids = Vec::with_capacity(chunk.len() / 6);
-            let mut local_names = FxHashMap::default();
             for line in lines(chunk) {
                 let Some(row) = ParsedRow::<7>::parse(line) else {
                     continue;
@@ -326,9 +326,9 @@ pub fn clicks<'a>(
     // idempotent. Streaming identical clicks avoids a separate ID partition.
     let by_person = csv_chunks(files)
         .into_par_iter()
-        .map(|chunk| {
+        .map_init(FxHashMap::default, |local, chunk| {
+            local.clear();
             let mut routed = buckets();
-            let mut local = FxHashMap::default();
             for row in lines(chunk).filter_map(ParsedRow::<4>::parse) {
                 let [id, person, campaign, raw_time] = row.values();
                 if id.is_empty() || person.is_empty() {

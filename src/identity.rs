@@ -1,10 +1,10 @@
 use rustc_hash::FxHashMap;
 
 use crate::input::{data_lines, fields, lines};
+use crate::records::SHARDS;
 
 pub struct People<'a> {
     ids: FxHashMap<&'a [u8], usize>,
-    routes: Vec<(usize, u32)>,
 }
 
 struct Component<'a> {
@@ -59,20 +59,23 @@ impl<'a> People<'a> {
             nodes[left].size += nodes[right].size;
             nodes[left].name = nodes[left].name.min(nodes[right].name);
         }
-        let mut roots = vec![None; nodes.len()];
-        let routes = (0..nodes.len())
-            .map(|index| {
-                let representative = root(&mut nodes, index);
-                *roots[representative]
-                    .get_or_insert_with(|| intern_root(nodes[representative].name))
-            })
-            .collect();
-        Self { ids, routes }
+        let mut routes = vec![usize::MAX; nodes.len()];
+        for index in ids.values_mut() {
+            let representative = root(&mut nodes, *index);
+            let route = &mut routes[representative];
+            if *route == usize::MAX {
+                let (bucket, person) = intern_root(nodes[representative].name);
+                *route = (person as usize) * SHARDS + bucket;
+            }
+            *index = *route;
+        }
+        Self { ids }
     }
 
     #[inline]
     pub fn linked_route(&self, name: &[u8]) -> Option<(usize, u32)> {
-        self.ids.get(name).map(|&index| self.routes[index])
+        let &route = self.ids.get(name)?;
+        Some((route % SHARDS, (route / SHARDS) as u32))
     }
 }
 
